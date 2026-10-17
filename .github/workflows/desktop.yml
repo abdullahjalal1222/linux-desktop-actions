@@ -1,0 +1,2194 @@
+name: Desktop
+
+on:
+  # dispatch-only: a stray push cannot (re)start a desktop session
+  workflow_dispatch:
+    inputs:
+      keep-alive:
+        description: 'Keep the 6-hour chain running (uncheck to stop after this session)'
+        type: boolean
+        default: true
+
+jobs:
+  desktop:
+    runs-on: ubuntu-latest
+    # 330 not 360: leave a 30 minute cushion so the final steps actually run.
+    timeout-minutes: 330
+    permissions:
+      actions: write
+      contents: read
+    env:
+      UID_NUM: '911'
+      GID_NUM: '911'
+    steps:
+      - name: Restore saved state
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-boot
+          restore-keys: |
+            webtop-state-
+
+      - name: Clean old cache entries
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data } = await github.rest.actions.getActionsCacheList({
+              owner: context.repo.owner, repo: context.repo.repo, per_page: 100
+            });
+            const list = data.actions_caches.sort((a, b) =>
+              new Date(b.last_accessed_at) - new Date(a.last_accessed_at));
+            for (const c of list.slice(12)) {
+              await github.rest.actions.deleteActionsCacheById({
+                owner: context.repo.owner, repo: context.repo.repo, cache_id: c.id
+              });
+            }
+            core.info('caches: kept ' + Math.min(12, list.length) + ', deleted ' + Math.max(0, list.length - 12));
+
+      - name: Start Docker
+        run: |
+          mkdir -p config
+          {
+            echo "=== THIS RUN: ${{ github.run_id }} ==="
+            echo "KEEP-ALIVE: ${{ inputs.keep-alive }}"
+            if [ -f state/config.tar.gz ]; then
+              tar xzf state/config.tar.gz -C config --no-same-owner
+              rm -rf config/.dbus config/.pulse config/.config/pulse config/.cache config/.XDG config/.ICEauthority
+              find config -name '*.lock' -delete 2>/dev/null || true
+              sudo chown -R "$UID_NUM:$GID_NUM" config
+              sudo chmod -R u+rwX config
+              echo "STATE: RESTORED ($(find config -type f | wc -l) files)"
+              echo "MARKER-FROM-PREV-RUN: $(cat config/.session-marker 2>/dev/null || echo NONE)"
+              echo "DESKTOP-FROM-PREV-RUN: $(tr '\n' ' ' < state/desktop.txt 2>/dev/null || echo NONE)"
+            else
+              echo "STATE: FRESH (brand new - nothing saved before)"
+              echo "MARKER-FROM-PREV-RUN: NONE"
+              echo "DESKTOP-FROM-PREV-RUN: NONE"
+            fi
+          } | tee /tmp/status.txt
+          docker run -d \
+            --name webtop \
+            --network host \
+            --security-opt seccomp=unconfined \
+            --shm-size=1gb \
+            --restart unless-stopped \
+            -v "$PWD/config:/config" \
+            -e CUSTOM_USER=admin \
+            -e PUID=$UID_NUM \
+            -e PGID=$GID_NUM \
+            -e PASSWORD="${{ secrets.WEBTOP_PASSWORD }}" \
+            ghcr.io/linuxserver/webtop
+          sleep 80
+          docker exec webtop sh -c 'pgrep -x xfce4-session >/dev/null && echo "XFCE-SESSION: RUNNING" || echo "XFCE-SESSION: DEAD"' | tee -a /tmp/status.txt || true
+
+      - name: Reinstall saved packages
+        continue-on-error: true
+        run: |
+          if [ ! -f state/packages.txt ]; then
+            echo "no package list - fresh system"
+            exit 0
+          fi
+          grep -v '^$' state/packages.txt > /tmp/want.txt || true
+          echo "replaying $(wc -l < /tmp/want.txt) explicitly-installed packages"
+          docker cp /tmp/want.txt webtop:/tmp/want.txt
+          docker exec webtop sh -c 'xargs apk add --no-cache < /tmp/want.txt 2>&1 | tail -5 || true'
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          echo "PACKAGES-TOTAL: $(docker exec webtop sh -c 'wc -l < /etc/apk/world' | tr -d ' \r')" >> /tmp/status.txt
+
+      - name: Install cloudflared
+        run: |
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared-linux-amd64.deb >/dev/null 2>&1
+
+      - name: Expose desktop and print URL
+        run: |
+          nohup cloudflared tunnel --url http://localhost:3000 > /tmp/tunnel.log 2>&1 &
+          echo $! > /tmp/tunnel.pid
+          URL=""
+          for i in $(seq 1 60); do
+            URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/tunnel.log | head -1 || true)
+            [ -n "$URL" ] && break
+            sleep 2
+          done
+          [ -z "$URL" ] && { echo "::error::no tunnel URL"; exit 1; }
+          echo "$URL" > /tmp/url.txt
+          tail -n +2 /tmp/status.txt >> /tmp/url.txt
+          { cat /tmp/status.txt; echo "(URL withheld - see tunnel-url artifact)"; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload URL artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tunnel-url
+          path: /tmp/url.txt
+          retention-days: 1
+
+      - name: Email login details
+        if: always()
+        env:
+          RESEND_KEY: ${{ secrets.RESEND_API_KEY }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          WEBTOP_PASSWORD: ${{ secrets.WEBTOP_PASSWORD }}
+        run: |
+          URL="$(head -1 /tmp/url.txt 2>/dev/null || true)"
+          {
+            echo "URL=$URL"
+            echo "MAIL_TO=$MAIL_TO"
+            echo "MAIL_FROM=$MAIL_FROM"
+            echo "KEY_PRESENT=$([ -n "$RESEND_KEY" ] && echo yes || echo no)"
+            if [ -z "$RESEND_KEY" ]; then
+              echo "RESULT=SKIPPED-no-key"
+            else
+              DOMAIN="${URL#https://}"; DOMAIN="${DOMAIN%%/*}"
+              SUBJECT="Linux Desktop ready - $DOMAIN"
+              PAYLOAD=$(jq -nc --arg f "$MAIL_FROM" --arg to "$MAIL_TO" --arg s "$SUBJECT" --arg u "$URL" --arg p "$WEBTOP_PASSWORD" \
+                '{from:$f, to:[$to], subject:$s,
+                  html:("<html><body style=\"font-family:Arial;background:#f4f5f7;padding:24px\"><div style=\"max-width:560px;margin:auto;background:#fff;border-radius:12px;overflow:hidden\"><div style=\"background:#2563eb;padding:20px;color:#fff;font-size:19px\">Linux Desktop ready</div><div style=\"padding:24px\"><p style=\"color:#666;font-size:13px;margin:0 0 6px\">URL</p><p style=\"margin:0 0 18px;font-size:15px\"><a href=\""+$u+"\">"+$u+"</a></p><p style=\"color:#666;font-size:13px;margin:0 0 6px\">Username</p><p style=\"margin:0 0 18px;font-family:monospace;font-size:16px;background:#f1f5f9;padding:8px 12px;border-radius:6px\">admin</p><p style=\"color:#666;font-size:13px;margin:0 0 6px\">Password</p><p style=\"margin:0;font-family:monospace;font-size:16px;background:#f1f5f9;padding:8px 12px;border-radius:6px\">"+$p+"</p></div></div></body></html>")}')
+              CODE=$(curl -s -o /tmp/res.json -w '%{http_code}' -X POST https://api.resend.com/emails \
+                -H "Authorization: Bearer $RESEND_KEY" -H "Content-Type: application/json" -d "$PAYLOAD")
+              echo "HTTP=$CODE"
+              echo "BODY=$(head -c 400 /tmp/res.json)"
+              if [ "$CODE" = "200" ]; then echo "RESULT=SENT"; else echo "RESULT=FAILED"; fi
+            fi
+          } > /tmp/email-status.txt
+          # SECURITY: never tee this to stdout - the job log of a PUBLIC repo is
+          # world-readable for completed runs, which would leak the live URL.
+          grep -v '^URL=' /tmp/email-status.txt | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload email status
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: email-status
+          path: /tmp/email-status.txt
+          retention-days: 7
+
+
+      - name: Save 1
+        if: always()
+        continue-on-error: true
+        run: |
+          true
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-1 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-1
+
+      - name: Save 2
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-2 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-2
+
+      - name: Save 3
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-3 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-3
+
+      - name: Save 4
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-4 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-4
+
+      - name: Save 5
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-5 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-5
+
+      - name: Save 6
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-6 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-6
+
+      - name: Save 7
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-7 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-7
+
+      - name: Save 8
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-8 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-8
+
+      - name: Save 9
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-9 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-9
+
+      - name: Save 10
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-10 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-10
+
+      - name: Save 11
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-11 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-11
+
+      - name: Save 12
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-12 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-12
+
+      - name: Save 13
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-13 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-13
+
+      - name: Save 14
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-14 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-14
+
+      - name: Save 15
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-15 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-15
+
+      - name: Save 16
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-16 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-16
+
+      - name: Save 17
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-17 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-17
+
+      - name: Save 18
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-18 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-18
+
+      - name: Save 19
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-19 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-19
+
+      - name: Save 20
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-20 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-20
+
+      - name: Save 21
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-21 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-21
+
+      - name: Save 22
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-22 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-22
+
+      - name: Save 23
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-23 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-23
+
+      - name: Save 24
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-24 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-24
+
+      - name: Save 25
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-25 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-25
+
+      - name: Save 26
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-26 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-26
+
+      - name: Save 27
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-27 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-27
+
+      - name: Save 28
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-28 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-28
+
+      - name: Save 29
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-29 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-29
+
+      - name: Save 30
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-30 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-30
+
+      - name: Save 31
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-31 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-31
+
+      - name: Save 32
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-32 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-32
+
+      - name: Save 33
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-33 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-33
+
+      - name: Save 34
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-34 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-34
+
+      - name: Save 35
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-35 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-35
+
+      - name: Save 36
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-36 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-36
+
+      - name: Save 37
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-37 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-37
+
+      - name: Save 38
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-38 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-38
+
+      - name: Save 39
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-39 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-39
+
+      - name: Save 40
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-40 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-40
+
+      - name: Save 41
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-41 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-41
+
+      - name: Save 42
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-42 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-42
+
+      - name: Save 43
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-43 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-43
+
+      - name: Save 44
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-44 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-44
+
+      - name: Save 45
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-45 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-45
+
+      - name: Save 46
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-46 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-46
+
+      - name: Save 47
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-47 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-47
+
+      - name: Save 48
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-48 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-48
+
+      - name: Save 49
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-49 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-49
+
+      - name: Save 50
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-50 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-50
+
+      - name: Save 51
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-51 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-51
+
+      - name: Save 52
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-52 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-52
+
+      - name: Save 53
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-53 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-53
+
+      - name: Save 54
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-54 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-54
+
+      - name: Save 55
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-55 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-55
+
+      - name: Save 56
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-56 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-56
+
+      - name: Save 57
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-57 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-57
+
+      - name: Save 58
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-58 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-58
+
+      - name: Save 59
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-59 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-59
+
+      - name: Save 60
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-60 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-60
+
+      - name: Save 61
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-61 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-61
+
+      - name: Save 62
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-62 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-62
+
+      - name: Save 63
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-63 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-63
+
+      - name: Save 64
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-64 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-64
+
+      - name: Save 65
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-65 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-65
+
+      - name: Save 66
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-66 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-66
+
+      - name: Save 67
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-67 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-67
+
+      - name: Save 68
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-68 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-68
+
+      - name: Save 69
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-69 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-69
+
+      - name: Save 70
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-70 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-70
+
+      - name: Save 71
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-71 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-71
+
+      - name: Save 72
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-72 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-72
+
+      - name: Save 73
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-73 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-73
+
+      - name: Save 74
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-74 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-74
+
+      - name: Save 75
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-75 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-75
+
+      - name: Save 76
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-76 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-76
+
+      - name: Save 77
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-77 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-77
+
+      - name: Save 78
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-78 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-78
+
+      - name: Save 79
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-79 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-79
+
+      - name: Save 80
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-80 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-80
+
+      - name: Save 81
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-81 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-81
+
+      - name: Save 82
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-82 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-82
+
+      - name: Save 83
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-83 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-83
+
+      - name: Save 84
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-84 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-84
+
+      - name: Save 85
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-85 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-85
+
+      - name: Save 86
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-86 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-86
+
+      - name: Save 87
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-87 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-87
+
+      - name: Save 88
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-88 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-88
+
+      - name: Save 89
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-89 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-89
+
+      - name: Save 90
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-90 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-90
+
+      - name: Save 91
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-91 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-91
+
+      - name: Save 92
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-92 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-92
+
+      - name: Save 93
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-93 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-93
+
+      - name: Save 94
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-94 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-94
+
+      - name: Save 95
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-95 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-95
+
+      - name: Save 96
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-96 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-96
+
+      - name: Save 97
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-97 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-97
+
+      - name: Save 98
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-98 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-98
+
+      - name: Save 99
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-99 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-99
+
+      - name: Save 100
+        if: always()
+        continue-on-error: true
+        run: |
+          sleep 170
+          mkdir -p state
+          docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-100 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
+          docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
+          docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
+          docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
+          docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+      - uses: actions/cache/save@v4
+        if: always()
+        continue-on-error: true
+        with:
+          path: state
+          key: webtop-state-${{ github.run_id }}-100
+
+      - name: Chain summary
+        if: always()
+        run: |
+          {
+            echo "### Chain status"
+            echo ""
+            echo "- session run id: ${{ github.run_id }}"
+            echo "- keep-alive: ${{ inputs.keep-alive }}"
+            echo "- saves every ~2.9 min, cache kept to newest 12"
+            echo "- renewer dispatched in the next step"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Hand over to renewer
+        if: ${{ always() && inputs.keep-alive != false }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'renew.yml',
+              ref: context.ref,
+              inputs: { keep_alive: String(${{ inputs.keep-alive }}) }
+            });
+            core.info('Renewer session dispatched. This run ends here.');
