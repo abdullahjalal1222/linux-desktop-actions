@@ -1,0 +1,61 @@
+name: Watchdog
+
+# Independent safety net. If the Desktop chain ever dies (for any reason: a
+# failed dispatch, a disabled repo setting, a quota exhaustion), this finds it
+# and restarts the chain. Runs every 30 minutes.
+
+on:
+  schedule:
+    - cron: '13,43 * * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Restart the chain if nothing is running
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo  = context.repo.repo;
+
+            const runs = await github.rest.actions.listWorkflowRunsForRepo({
+              owner, repo, per_page: 30
+            });
+            const live = runs.data.workflow_runs.filter(
+              r => r.name === 'Desktop' &&
+                   (r.status === 'in_progress' || r.status === 'queued')
+            );
+            const keepAlive = live.filter(r => r.event === 'workflow_dispatch');
+
+            if (keepAlive.length > 0) {
+              core.info('Chain is healthy, ' + keepAlive.length + ' live Desktop session(s).');
+              return;
+            }
+
+            core.info('NO live keep-alive Desktop session. Restarting the chain.');
+
+            for (const r of live) {
+              try {
+                await github.rest.actions.cancelWorkflowRun({ owner, repo, run_id: r.id });
+                core.info('cancelled wedged run #' + r.run_number);
+              } catch (e) { core.warning(e.message); }
+            }
+
+            await github.rest.actions.createWorkflowDispatch({
+              owner, repo,
+              workflow_id: 'desktop.yml',
+              ref: context.ref,
+              inputs: { 'keep-alive': 'true' }
+            });
+            core.info('Chain restarted with keep-alive=true.');
+
+      - name: Report
+        if: always()
+        run: echo "watchdog checked at ${{ github.run_started_at }}" >> "$GITHUB_STEP_SUMMARY"
