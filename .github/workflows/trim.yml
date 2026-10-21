@@ -1,0 +1,67 @@
+name: Trim
+
+# The repo-wide GitHub Actions cache limit is 10 GB. A single snapshot of this
+# desktop is ~1.3-2 GB, so a session that runs for hours will push the repo
+# over the limit. GitHub then silently evicts entries, which is wasteful and
+# puts the restore target at risk.
+#
+# This job trims the cache back under budget every 7 minutes, always keeping
+# the two most recently used snapshots. It never touches the running session.
+
+on:
+  schedule:
+    - cron: '*/7 * * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  trim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Delete the oldest caches until we fit the quota
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUDGET_MB: '8000'
+          KEEP: '2'
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess, sys
+
+          budget = int(os.environ["BUDGET_MB"]) * 1024 * 1024
+          keep = int(os.environ["KEEP"])
+          repo = os.environ["GITHUB_REPOSITORY"]
+
+          r = subprocess.run(["gh", "api", "repos/%s/actions/caches?per_page=100" % repo],
+                             capture_output=True, text=True)
+          if r.returncode != 0:
+              print("cannot list caches:", r.stderr.strip()[:200])
+              sys.exit(0)
+          try:
+              caches = json.loads(r.stdout)["actions_caches"]
+          except Exception as e:
+              print("cannot parse cache list:", e)
+              sys.exit(0)
+
+          caches.sort(key=lambda c: c["last_accessed_at"], reverse=True)
+          total = sum(c["size_in_bytes"] for c in caches)
+          before = len(caches)
+          deleted = 0
+          for c in caches[keep:]:
+              if total <= budget:
+                  break
+              d = subprocess.run(
+                  ["gh", "api", "-X", "DELETE",
+                   "repos/%s/actions/caches/%d" % (repo, c["id"])],
+                  capture_output=True, text=True)
+              if d.returncode == 0:
+                  total -= c["size_in_bytes"]
+                  deleted += 1
+              else:
+                  print("delete failed:", d.stderr.strip()[:150])
+          print("caches: %d -> %d, deleted %d, total now %.1f MB of 10240 MB"
+                % (before, before - deleted, deleted, total / 1048576.0))
+          PY
