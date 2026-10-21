@@ -1,13 +1,27 @@
 name: Renew
 
-# The renewer exists for one reason: the main desktop job can be killed by the
-# runner timeout before its own final steps execute. This job starts while the
-# main job is still healthy and stays alive to do the renewal, so a chain break
-# cannot happen silently.
+# The renewer is the guarantee that the chain never breaks.
+#
+# It is armed at the START of a Desktop session (not at the end - the end
+# never runs because the Desktop job is killed by its own timeout first).
+# It watches one specific Desktop run by id. When that run finishes:
+#
+#   conclusion == success -> the Desktop already dispatched the next session
+#                            itself, so the renewer does nothing.
+#   anything else        -> the Desktop was killed before it could hand over,
+#                            so the renewer dispatches the replacement.
+#
+# IMPORTANT: GitHub silently ignores `workflow_id` when it is a workflow file
+# NAME - the API returns every workflow's runs. Always filter on
+# `name === 'Desktop'` in JavaScript, never on a server side workflow_id.
 
 on:
   workflow_dispatch:
     inputs:
+      watch_run:
+        description: 'Run id of the Desktop session to watch'
+        required: false
+        default: '0'
       keep_alive:
         description: 'Chain the next session (false stops after the next one)'
         required: false
@@ -20,59 +34,130 @@ permissions:
 jobs:
   renew:
     runs-on: ubuntu-latest
-    # Main session: 100 save cycles x 170s plus setup is around 4.8h.
-    # Sleep 5.5h so this job is still alive when the main job finishes.
-    timeout-minutes: 340
+    # Must outlive the Desktop job (350 min) so it can catch its death.
+    timeout-minutes: 358
     steps:
-      - name: Wait out the current desktop session
-        run: |
-          echo "Session started at ${{ github.run_started_at }}"
-          echo "Holding this renewer alive until the desktop session has ended."
-          echo "Renewal happens in the final step, well inside the 340 minute limit."
-          sleep 19800
-
-      - name: Renew the desktop
+      - name: Wait for the watched Desktop session to finish
+        id: watch
         uses: actions/github-script@v7
         with:
           script: |
             const owner = context.repo.owner;
             const repo  = context.repo.repo;
+            const watch = '${{ inputs.watch_run }}';
+            const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-            const runs = await github.rest.actions.listWorkflowRunsForRepo({
-              owner, repo, per_page: 30
-            });
-            const desktop = runs.data.workflow_runs.filter(
-              r => r.name === 'Desktop' && (r.status === 'in_progress' || r.status === 'queued')
-            );
-            for (const r of desktop) {
-              core.info('Cancelling stale Desktop run #' + r.run_number);
-              try {
-                await github.rest.actions.cancelWorkflowRun({ owner, repo, run_id: r.id });
-              } catch (e) { core.warning('cancel failed: ' + e.message); }
+            let conclusion = 'watch-timeout';
+            let runNumber = '?';
+
+            if (watch && watch !== '0') {
+              for (let i = 0; i < 1150; i++) {      // 1150 * 30 s = ~9.5 h
+                const { data } = await github.rest.actions.getWorkflowRun({
+                  owner, repo, run_id: Number(watch)
+                });
+                runNumber = data.run_number;
+                if (data.status === 'completed') {
+                  conclusion = data.conclusion || 'unknown';
+                  core.info('Watched run #' + runNumber + ' finished: ' + conclusion);
+                  break;
+                }
+                if (i % 20 === 0) {
+                  core.info('still waiting on run #' + runNumber + ' (' + data.status + ')');
+                }
+                await sleep(30000);
+              }
+            } else {
+              core.warning('No run id given; falling back to "is anything live?".');
             }
 
-            await github.rest.actions.createWorkflowDispatch({
-              owner, repo,
-              workflow_id: 'desktop.yml',
-              ref: context.ref,
-              inputs: { 'keep-alive': '${{ inputs.keep_alive }}' }
-            });
-            core.info('Next desktop session dispatched, keep-alive=${{ inputs.keep_alive }}');
+            await sleep(20000);   // let the runner release fully
+            core.setOutput('conclusion', conclusion);
+            core.setOutput('run_number', runNumber);
 
-      - name: Wait for the new session to publish its URL
+      - name: Chain the next session
+        uses: actions/github-script@v7
+        env:
+          CONCLUSION: ${{ steps.watch.outputs.conclusion }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo  = context.repo.repo;
+            const conclusion = process.env.CONCLUSION || 'unknown';
+
+            if (conclusion === 'success') {
+              core.info('Desktop finished cleanly and already chained the next session. Nothing to do.');
+              return;
+            }
+
+            core.info('Desktop did NOT finish cleanly (' + conclusion + '). Chaining the next session.');
+
+            // NOTE: no server side workflow_id filter - GitHub ignores it when
+            // it is a file name and returns every workflow's runs. Filter on
+            // the workflow name in JavaScript instead.
+            const isLiveDesktop = async () => {
+              const { data } = await github.rest.actions.listWorkflowRunsForRepo({
+                owner, repo, per_page: 30
+              });
+              return data.workflow_runs.filter(
+                r => r.name === 'Desktop' &&
+                     (r.status === 'in_progress' || r.status === 'queued'));
+            };
+
+            for (let attempt = 1; attempt <= 6; attempt++) {
+              const live = await isLiveDesktop();
+              if (live.length > 0) {
+                core.info('A Desktop session is already live (' +
+                  live.map(r => r.run_number).join(', ') + '). Not dispatching another.');
+                return;
+              }
+              try {
+                await github.rest.actions.createWorkflowDispatch({
+                  owner, repo,
+                  workflow_id: 'desktop.yml',
+                  ref: context.ref,
+                  inputs: { 'keep-alive': '${{ inputs.keep_alive }}' }
+                });
+                core.info('Dispatch request sent (attempt ' + attempt + '). Waiting for it to appear...');
+              } catch (e) {
+                core.warning('dispatch attempt ' + attempt + ' failed: ' + e.message);
+                await new Promise(r => setTimeout(r, 15000));
+                continue;
+              }
+
+              // Verify the dispatch actually produced a run. A dispatch can be
+              // accepted and still never start, so never trust the request.
+              for (let w = 0; w < 12; w++) {
+                await new Promise(r => setTimeout(r, 10000));
+                const { data } = await github.rest.actions.listWorkflowRunsForRepo({
+                  owner, repo, per_page: 30
+                });
+                const fresh = data.workflow_runs.filter(
+                  r => r.name === 'Desktop' &&
+                       (r.status === 'in_progress' || r.status === 'queued'));
+                if (fresh.length > 0) {
+                  core.info('Next Desktop session is live: #' + fresh.map(r => r.run_number).join(', '));
+                  return;
+                }
+              }
+              core.warning('the dispatch did not start a run, trying again');
+            }
+            core.setFailed('Could not start the next Desktop session.');
+
+      - name: Confirm the new session published its URL and emailed
+        if: always()
         run: |
-          echo "Polling for the new session artifact"
+          echo "Waiting for the new session to publish its URL and send the email..."
           for i in $(seq 1 40); do
             sleep 30
-            LIST=$(gh api "repos/${{ github.repository }}/actions/runs?per_page=10" \
-                   --jq '.workflow_runs[] | select(.name=="Desktop" and .status=="in_progress") | .id' 2>/dev/null | head -1)
+            LIST=$(gh api "repos/${{ github.repository }}/actions/runs?per_page=20" \
+                   --jq '.workflow_runs[] | select(.name=="Desktop" and (.status=="in_progress" or .status=="queued")) | .id' 2>/dev/null | head -1)
             [ -z "$LIST" ] && continue
-            URLFILE=$(gh api "repos/${{ github.repository }}/actions/runs/$LIST/artifacts" \
+            ESFILE=$(gh api "repos/${{ github.repository }}/actions/runs/$LIST/artifacts" \
                       --jq '.artifacts[] | select(.name=="email-status") | .archive_download_url' 2>/dev/null | head -1)
-            [ -z "$URLFILE" ] && continue
-            if gh api "$URLFILE" > /tmp/es.zip 2>/dev/null && unzip -o -q /tmp/es.zip -d /tmp/es 2>/dev/null; then
+            [ -z "$ESFILE" ] && continue
+            if gh api "$ESFILE" > /tmp/es.zip 2>/dev/null && unzip -o -q /tmp/es.zip -d /tmp/es 2>/dev/null; then
               if grep -q 'RESULT=SENT' /tmp/es/email-status.txt 2>/dev/null; then
-                echo ">>> CHAIN HEALTHY: new session is live and emailed"
+                echo ">>> CHAIN HEALTHY: the new session is live and the email was sent"
                 exit 0
               fi
             fi
@@ -85,6 +170,7 @@ jobs:
           {
             echo "### Renewer finished"
             echo ""
-            echo "- dispatched at: ${{ github.run_started_at }}"
+            echo "- watched run: ${{ steps.watch.outputs.run_number }}"
+            echo "- its conclusion: ${{ steps.watch.outputs.conclusion }}"
             echo "- keep_alive: ${{ inputs.keep_alive }}"
           } >> "$GITHUB_STEP_SUMMARY"
