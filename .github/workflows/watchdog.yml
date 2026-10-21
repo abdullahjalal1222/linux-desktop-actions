@@ -1,8 +1,14 @@
 name: Watchdog
 
-# Independent safety net. If the Desktop chain ever dies (for any reason: a
-# failed dispatch, a disabled repo setting, a quota exhaustion), this finds it
-# and restarts the chain. Runs every 30 minutes.
+# Last-resort safety net. The renewer normally chains every session within
+# ~30 seconds of the previous one dying. This only matters if the renewer
+# itself failed (dispatch error, quota, repo setting changed).
+#
+# Runs every 30 minutes.
+#
+# IMPORTANT: GitHub silently ignores `workflow_id` when it is a workflow file
+# NAME - the API returns every workflow's runs. Always filter on
+# `name === 'Desktop'` in JavaScript, never on a server side workflow_id.
 
 on:
   schedule:
@@ -24,37 +30,50 @@ jobs:
           script: |
             const owner = context.repo.owner;
             const repo  = context.repo.repo;
+            const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-            const runs = await github.rest.actions.listWorkflowRunsForRepo({
+            const { data } = await github.rest.actions.listWorkflowRunsForRepo({
               owner, repo, per_page: 30
             });
-            const live = runs.data.workflow_runs.filter(
-              r => r.name === 'Desktop' &&
-                   (r.status === 'in_progress' || r.status === 'queued')
-            );
-            const keepAlive = live.filter(r => r.event === 'workflow_dispatch');
 
-            if (keepAlive.length > 0) {
-              core.info('Chain is healthy, ' + keepAlive.length + ' live Desktop session(s).');
+            // Filter by workflow NAME, not by a server side workflow_id.
+            const desktops = data.workflow_runs.filter(r => r.name === 'Desktop');
+            const live = desktops.filter(
+              r => r.status === 'in_progress' || r.status === 'queued');
+
+            if (live.length > 0) {
+              core.info('Chain is healthy, live Desktop session(s): ' +
+                live.map(r => r.run_number).join(', '));
               return;
             }
 
-            core.info('NO live keep-alive Desktop session. Restarting the chain.');
-
-            for (const r of live) {
-              try {
-                await github.rest.actions.cancelWorkflowRun({ owner, repo, run_id: r.id });
-                core.info('cancelled wedged run #' + r.run_number);
-              } catch (e) { core.warning(e.message); }
+            // Do not fire if a session was started moments ago - it may still
+            // be in the queue and about to register as in_progress.
+            const recent = desktops.filter(
+              r => (Date.now() - new Date(r.run_started_at || r.created_at)) < 5 * 60 * 1000);
+            if (recent.length > 0) {
+              core.info('A Desktop session started moments ago and is probably still starting. Waiting.');
+              return;
             }
 
-            await github.rest.actions.createWorkflowDispatch({
-              owner, repo,
-              workflow_id: 'desktop.yml',
-              ref: context.ref,
-              inputs: { 'keep-alive': 'true' }
-            });
-            core.info('Chain restarted with keep-alive=true.');
+            core.info('NO live Desktop session. Restarting the chain.');
+
+            for (let attempt = 1; attempt <= 3; attempt++) {
+              try {
+                await github.rest.actions.createWorkflowDispatch({
+                  owner, repo,
+                  workflow_id: 'desktop.yml',
+                  ref: context.ref,
+                  inputs: { 'keep-alive': 'true' }
+                });
+                core.info('Chain restarted with keep-alive=true (attempt ' + attempt + ').');
+                return;
+              } catch (e) {
+                core.warning('dispatch attempt ' + attempt + ' failed: ' + e.message);
+                await sleep(15000);
+              }
+            }
+            core.setFailed('Could not restart the chain.');
 
       - name: Report
         if: always()
