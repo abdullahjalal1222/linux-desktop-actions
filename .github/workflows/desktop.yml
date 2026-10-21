@@ -12,8 +12,10 @@ on:
 jobs:
   desktop:
     runs-on: ubuntu-latest
-    # 330 not 360: leave a 30 minute cushion so the final steps actually run.
-    timeout-minutes: 330
+    # 100 save cycles x 165 s = 275 min, plus ~4 min setup and ~60 min of
+    # cushion so the final handover step always runs. A cycle is capped at
+    # max(165 s, work time) by the adaptive sleep inside each Save step.
+    timeout-minutes: 350
     permissions:
       actions: write
       contents: read
@@ -38,14 +40,27 @@ jobs:
             const { data } = await github.rest.actions.getActionsCacheList({
               owner: context.repo.owner, repo: context.repo.repo, per_page: 100
             });
+            // Size-aware cleanup. The repo-wide cache limit is 10 GB and each
+            // snapshot can be ~2 GB, so keeping a fixed count overflows the
+            // quota and GitHub silently evicts entries we still need.
+            // Rule: always keep the 2 newest, then delete oldest-first until
+            // the total is under BUDGET.
+            const BUDGET = Math.round(8.5 * 1024 * 1024 * 1024);
             const list = data.actions_caches.sort((a, b) =>
               new Date(b.last_accessed_at) - new Date(a.last_accessed_at));
-            for (const c of list.slice(12)) {
-              await github.rest.actions.deleteActionsCacheById({
-                owner: context.repo.owner, repo: context.repo.repo, cache_id: c.id
-              });
+            let total = list.reduce((s, c) => s + c.size_in_bytes, 0);
+            let deleted = 0;
+            for (let i = 2; i < list.length && total > BUDGET; i++) {
+              try {
+                await github.rest.actions.deleteActionsCacheById({
+                  owner: context.repo.owner, repo: context.repo.repo, cache_id: list[i].id
+                });
+                total -= list[i].size_in_bytes;
+                deleted++;
+              } catch (e) { core.warning('delete failed: ' + e.message); }
             }
-            core.info('caches: kept ' + Math.min(12, list.length) + ', deleted ' + Math.max(0, list.length - 12));
+            core.info('caches: kept newest 2, deleted ' + deleted +
+              ', total now ' + (total / 1048576).toFixed(1) + ' MB of 10240 MB');
 
       - name: Start Docker
         run: |
@@ -143,12 +158,21 @@ jobs:
               echo "RESULT=SKIPPED-no-key"
             else
               DOMAIN="${URL#https://}"; DOMAIN="${DOMAIN%%/*}"
-              SUBJECT="Linux Desktop ready - $DOMAIN"
-              PAYLOAD=$(jq -nc --arg f "$MAIL_FROM" --arg to "$MAIL_TO" --arg s "$SUBJECT" --arg u "$URL" --arg p "$WEBTOP_PASSWORD" \
+              UTC_NOW=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+              IRQ_NOW=$(date -u -d '+3 hours' '+%Y-%m-%d %H:%M:%S Baghdad')
+              SUBJECT="Linux Desktop ready - $DOMAIN - $UTC_NOW"
+              PAYLOAD=$(jq -nc --arg f "$MAIL_FROM" --arg to "$MAIL_TO" --arg s "$SUBJECT" --arg u "$URL" --arg p "$WEBTOP_PASSWORD" --arg utc "$UTC_NOW" --arg irq "$IRQ_NOW" \
                 '{from:$f, to:[$to], subject:$s,
-                  html:("<html><body style=\"font-family:Arial;background:#f4f5f7;padding:24px\"><div style=\"max-width:560px;margin:auto;background:#fff;border-radius:12px;overflow:hidden\"><div style=\"background:#2563eb;padding:20px;color:#fff;font-size:19px\">Linux Desktop ready</div><div style=\"padding:24px\"><p style=\"color:#666;font-size:13px;margin:0 0 6px\">URL</p><p style=\"margin:0 0 18px;font-size:15px\"><a href=\""+$u+"\">"+$u+"</a></p><p style=\"color:#666;font-size:13px;margin:0 0 6px\">Username</p><p style=\"margin:0 0 18px;font-family:monospace;font-size:16px;background:#f1f5f9;padding:8px 12px;border-radius:6px\">admin</p><p style=\"color:#666;font-size:13px;margin:0 0 6px\">Password</p><p style=\"margin:0;font-family:monospace;font-size:16px;background:#f1f5f9;padding:8px 12px;border-radius:6px\">"+$p+"</p></div></div></body></html>")}')
-              CODE=$(curl -s -o /tmp/res.json -w '%{http_code}' -X POST https://api.resend.com/emails \
-                -H "Authorization: Bearer $RESEND_KEY" -H "Content-Type: application/json" -d "$PAYLOAD")
+                  text:("Linux Desktop is ready.\n\nURL: "+$u+"\nUsername: admin\nPassword: "+$p+"\n\nSession started: "+$utc+"  ("+$irq+")\n"),
+                  html:("<html><body style=\"font-family:Arial;background:#f4f5f7;padding:24px\"><div style=\"max-width:560px;margin:auto;background:#fff;border-radius:12px;overflow:hidden\"><div style=\"background:#2563eb;padding:20px;color:#fff;font-size:19px\">Linux Desktop ready</div><div style=\"padding:24px\"><p style=\"color:#666;font-size:13px;margin:0 0 6px\">URL</p><p style=\"margin:0 0 18px;font-size:15px\"><a href=\""+$u+"\">"+$u+"</a></p><p style=\"color:#666;font-size:13px;margin:0 0 6px\">Username</p><p style=\"margin:0 0 18px;font-family:monospace;font-size:16px;background:#f1f5f9;padding:8px 12px;border-radius:6px\">admin</p><p style=\"color:#666;font-size:13px;margin:0 0 6px\">Password</p><p style=\"margin:0 0 18px;font-family:monospace;font-size:16px;background:#f1f5f9;padding:8px 12px;border-radius:6px\">"+$p+"</p><p style=\"color:#666;font-size:13px;margin:0\">Started "+$utc+" ("+$irq+")</p></div></div></body></html>")}')
+              CODE=000
+              for attempt in 1 2 3; do
+                CODE=$(curl -s -o /tmp/res.json -w '%{http_code}' -X POST https://api.resend.com/emails \
+                  -H "Authorization: Bearer $RESEND_KEY" -H "Content-Type: application/json" -d "$PAYLOAD")
+                echo "ATTEMPT=$attempt HTTP=$CODE"
+                if [ "$CODE" = "200" ]; then break; fi
+                sleep 15
+              done
               echo "HTTP=$CODE"
               echo "BODY=$(head -c 400 /tmp/res.json)"
               if [ "$CODE" = "200" ]; then echo "RESULT=SENT"; else echo "RESULT=FAILED"; fi
@@ -157,6 +181,12 @@ jobs:
           # SECURITY: never tee this to stdout - the job log of a PUBLIC repo is
           # world-readable for completed runs, which would leak the live URL.
           grep -v '^URL=' /tmp/email-status.txt | tee -a "$GITHUB_STEP_SUMMARY"
+          # Fail loudly. A green 'Email login details' step must mean the mail
+          # was actually accepted by Resend, not merely attempted.
+          if ! grep -q '^RESULT=SENT$' /tmp/email-status.txt; then
+            echo "::error::the login email was NOT sent - see the status above"
+            exit 1
+          fi
 
       - name: Upload email status
         if: always()
@@ -166,20 +196,74 @@ jobs:
           path: /tmp/email-status.txt
           retention-days: 7
 
+      - name: Measure state size
+        if: always()
+        continue-on-error: true
+        run: |
+          {
+            echo "=== /config breakdown (what makes the snapshot big) ==="
+            docker exec webtop sh -c 'du -am /config 2>/dev/null | sort -rn | head -25'
+            echo "=== tar size ==="
+            stat -c '%s bytes  %n' state/config.tar.gz 2>/dev/null || echo "no tar yet"
+            echo "=== home top-level ==="
+            docker exec webtop sh -c 'ls -A /config 2>/dev/null | head -40'
+            echo "=== excluded dirs still inside the archive (all should be 0) ==="
+            docker exec webtop sh -c 'tar tzf /tmp/cfg.tar.gz 2>/dev/null | grep -cE "^\./(\.cache|\.dbus|\.pulse|\.XDG)/"' || echo 0
+            echo "=== archive entry count ==="
+            docker exec webtop sh -c 'tar tzf /tmp/cfg.tar.gz 2>/dev/null | wc -l' || echo 0
+          } > /tmp/state-size.txt 2>&1 || true
+          cat /tmp/state-size.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        continue-on-error: true
+        with:
+          name: state-size
+          path: /tmp/state-size.txt
+          retention-days: 7
+
+      - name: Arm the renewer (safety net)
+        # The renewer MUST be armed here, at the START of the session, not in
+        # the last step. The last step never runs: the job is killed by its own
+        # timeout first, which is what caused 25..52 minutes of dead time
+        # between sessions and no renewal email.
+        if: ${{ inputs.keep-alive != false }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'renew.yml',
+              ref: context.ref,
+              inputs: {
+                watch_run: String(${{ github.run_id }}),
+                keep_alive: String(${{ inputs.keep-alive }})
+              }
+            });
+            core.info('Renewer armed for run ' + '${{ github.run_id }}');
+
 
       - name: Save 1
         if: always()
         continue-on-error: true
         run: |
-          true
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-1 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -191,15 +275,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-2 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -211,15 +302,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-3 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -231,15 +329,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-4 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -251,15 +356,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-5 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -271,15 +383,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-6 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -291,15 +410,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-7 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -311,15 +437,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-8 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -331,15 +464,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-9 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -351,15 +491,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-10 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -371,15 +518,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-11 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -391,15 +545,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-12 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -411,15 +572,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-13 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -431,15 +599,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-14 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -451,15 +626,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-15 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -471,15 +653,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-16 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -491,15 +680,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-17 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -511,15 +707,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-18 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -531,15 +734,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-19 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -551,15 +761,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-20 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -571,15 +788,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-21 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -591,15 +815,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-22 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -611,15 +842,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-23 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -631,15 +869,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-24 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -651,15 +896,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-25 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -671,15 +923,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-26 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -691,15 +950,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-27 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -711,15 +977,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-28 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -731,15 +1004,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-29 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -751,15 +1031,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-30 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -771,15 +1058,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-31 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -791,15 +1085,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-32 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -811,15 +1112,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-33 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -831,15 +1139,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-34 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -851,15 +1166,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-35 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -871,15 +1193,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-36 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -891,15 +1220,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-37 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -911,15 +1247,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-38 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -931,15 +1274,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-39 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -951,15 +1301,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-40 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -971,15 +1328,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-41 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -991,15 +1355,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-42 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1011,15 +1382,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-43 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1031,15 +1409,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-44 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1051,15 +1436,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-45 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1071,15 +1463,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-46 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1091,15 +1490,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-47 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1111,15 +1517,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-48 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1131,15 +1544,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-49 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1151,15 +1571,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-50 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1171,15 +1598,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-51 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1191,15 +1625,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-52 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1211,15 +1652,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-53 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1231,15 +1679,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-54 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1251,15 +1706,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-55 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1271,15 +1733,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-56 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1291,15 +1760,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-57 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1311,15 +1787,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-58 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1331,15 +1814,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-59 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1351,15 +1841,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-60 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1371,15 +1868,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-61 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1391,15 +1895,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-62 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1411,15 +1922,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-63 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1431,15 +1949,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-64 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1451,15 +1976,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-65 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1471,15 +2003,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-66 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1491,15 +2030,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-67 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1511,15 +2057,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-68 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1531,15 +2084,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-69 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1551,15 +2111,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-70 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1571,15 +2138,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-71 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1591,15 +2165,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-72 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1611,15 +2192,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-73 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1631,15 +2219,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-74 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1651,15 +2246,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-75 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1671,15 +2273,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-76 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1691,15 +2300,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-77 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1711,15 +2327,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-78 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1731,15 +2354,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-79 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1751,15 +2381,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-80 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1771,15 +2408,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-81 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1791,15 +2435,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-82 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1811,15 +2462,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-83 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1831,15 +2489,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-84 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1851,15 +2516,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-85 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1871,15 +2543,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-86 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1891,15 +2570,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-87 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1911,15 +2597,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-88 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1931,15 +2624,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-89 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1951,15 +2651,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-90 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1971,15 +2678,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-91 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -1991,15 +2705,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-92 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -2011,15 +2732,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-93 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -2031,15 +2759,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-94 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -2051,15 +2786,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-95 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -2071,15 +2813,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-96 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -2091,15 +2840,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-97 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -2111,15 +2867,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-98 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -2131,15 +2894,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-99 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -2151,15 +2921,22 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
-          sleep 170
+          T0=$(date +%s)
           mkdir -p state
           docker exec webtop sh -c "echo 'MARKER: run-${{ github.run_id }} save-100 $(date -u +%Y%m%dT%H%M%SZ)' > /config/.session-marker" || true
-          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config .
+          docker exec webtop tar czf /tmp/cfg.tar.gz -C /config --exclude='.cache' --exclude='.dbus' --exclude='.pulse' --exclude='.XDG' --exclude='.ICEauthority' --exclude='*.lock' --exclude='Cache' --exclude='cache2' --exclude='Code Cache' --exclude='GPUCache' --exclude='Crash Reports' --exclude='Trash' --exclude='transforms' --exclude='kotlin-dsl' --exclude='jar-cache' --exclude='executionHistory' --exclude='buildOutputCleanup' .
           docker cp webtop:/tmp/cfg.tar.gz state/config.tar.gz || true
           docker exec webtop sh -c 'cp /etc/apk/world /tmp/pkgs.txt 2>/dev/null || : > /tmp/pkgs.txt'
           docker cp webtop:/tmp/pkgs.txt state/packages.txt || true
           docker exec webtop sh -c 'ls -A /config/Desktop > /tmp/desktop.txt 2>/dev/null || true'
           docker cp webtop:/tmp/desktop.txt state/desktop.txt || true
+          T1=$(date +%s)
+          WORK=$((T1-T0))
+          SLEEP=$((165-WORK))
+          if [ "$SLEEP" -lt 5 ]; then SLEEP=5; fi
+          TAR=$(stat -c %s state/config.tar.gz 2>/dev/null || echo 0)
+          echo "cycle work=${WORK}s sleep=${SLEEP}s tar=${TAR}B"
+          sleep "$SLEEP"
       - uses: actions/cache/save@v4
         if: always()
         continue-on-error: true
@@ -2175,20 +2952,40 @@ jobs:
             echo ""
             echo "- session run id: ${{ github.run_id }}"
             echo "- keep-alive: ${{ inputs.keep-alive }}"
-            echo "- saves every ~2.9 min, cache kept to newest 12"
-            echo "- renewer dispatched in the next step"
+            echo "- saves every ~2.75 min (adaptive), cache budget 8.5 GB"
+            echo "- renewer was armed at session start; next session dispatched in the next step"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Hand over to renewer
+      - name: Hand over to the next session
         if: ${{ always() && inputs.keep-alive != false }}
         uses: actions/github-script@v7
         with:
           script: |
-            await github.rest.actions.createWorkflowDispatch({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              workflow_id: 'renew.yml',
-              ref: context.ref,
-              inputs: { keep_alive: String(${{ inputs.keep-alive }}) }
+            const { data } = await github.rest.actions.listWorkflowRunsForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              per_page: 20, workflow_id: 'desktop.yml'
             });
-            core.info('Renewer session dispatched. This run ends here.');
+            const live = data.workflow_runs.filter(
+              r => r.status === 'in_progress' || r.status === 'queued');
+            if (live.length > 0) {
+              core.info('A Desktop session is already live (' +
+                live.map(r => r.run_number).join(', ') + '). Not dispatching another.');
+              return;
+            }
+            for (let attempt = 1; attempt <= 5; attempt++) {
+              try {
+                await github.rest.actions.createWorkflowDispatch({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  workflow_id: 'desktop.yml',
+                  ref: context.ref,
+                  inputs: { 'keep-alive': String(${{ inputs.keep-alive }}) }
+                });
+                core.info('Next Desktop session dispatched (attempt ' + attempt + ').');
+                return;
+              } catch (e) {
+                core.warning('dispatch attempt ' + attempt + ' failed: ' + e.message);
+                await new Promise(r => setTimeout(r, 15000));
+              }
+            }
+            core.setFailed('Could not dispatch the next Desktop session.');
